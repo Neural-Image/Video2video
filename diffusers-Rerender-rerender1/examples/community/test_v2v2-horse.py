@@ -65,7 +65,7 @@ pipe = DiffusionPipeline.from_pretrained(
 #     "/home/ubuntu/sws/model/vae-ft-mse-840000-ema-pruned.ckpt").to('cuda')
 
 pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-pipe.enable_xformers_memory_efficient_attention()
+# pipe.enable_xformers_memory_efficient_attention()
 
 generator = torch.manual_seed(0)
 # frames = [Image.fromarray(frame) for frame in frames]
