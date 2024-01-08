@@ -15,7 +15,7 @@
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import einops
 import numpy as np
 import PIL.Image
 import torch
@@ -42,6 +42,31 @@ from utils.utils import InputPadder  # noqa: E402
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+from blendmodes.blend import BlendType, blendLayers
+from PIL import Image
+import cv2
+from skimage import exposure
+import torchvision.transforms as T
+totensor = T.PILToTensor()
+def setup_color_correction(image):
+    correction_target = cv2.cvtColor(np.asarray(image.copy()),
+                                     cv2.COLOR_RGB2LAB)
+    return correction_target
+
+
+def apply_color_correction(correction, original_image):
+    image = Image.fromarray(
+        cv2.cvtColor(
+            exposure.match_histograms(cv2.cvtColor(np.asarray(original_image),
+                                                   cv2.COLOR_RGB2LAB),
+                                      correction,
+                                      channel_axis=2),
+            cv2.COLOR_LAB2RGB).astype('uint8'))
+
+    image = blendLayers(image, original_image, BlendType.LUMINOSITY)
+
+    return image
 
 
 def coords_grid(b, h, w, homogeneous=False, device=None):
@@ -589,6 +614,8 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        bUseMaskControl: bool = True,
+        color_preserve:bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -835,6 +862,14 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             generator,
         )
 
+        if bUseMaskControl:
+
+            mask_control=torch.ones_like(latents)#(latents.shape[0:2], np.uint8)*255
+            zero_lines = int(latents.shape[2] * 2 / 3)
+            mask_control[:,:, 0:zero_lines, :]=0
+        else:
+            mask_control = None
+
         # 4.5 Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -850,6 +885,7 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         first_x0_list = []
 
         # 4.7 Denoising loop
+ 
         num_warmup_steps = len(timesteps) - cur_num_inference_steps * self.scheduler.order
         with self.progress_bar(total=cur_num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -896,7 +932,6 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
                 # predict the noise residual
-                print('latent sample: ', latent_model_input.shape)
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -919,7 +954,70 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                 first_x0_list.append(first_x0)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                latents_control1 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+
+
+
+                if bUseMaskControl == False:
+                    print('this way')
+                    latents = latents_control1  # latents_control1 [0.6, 0.2]
+
+                else:
+                    if isinstance(controlnet_keep[i], list):
+                        cond_scale = [cond_scale[1], cond_scale[0]]
+                        print('first img, control scale 2: ', cond_scale)
+                        #print('controlnet scale: ', cond_scale)
+                    else:
+                        controlnet_cond_scale = controlnet_conditioning_scale
+                        if isinstance(controlnet_cond_scale, list):
+                            controlnet_cond_scale = controlnet_cond_scale[0]
+                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
+
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=control_image,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        return_dict=False,
+                    )
+
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infered ControlNet only for the conditional batch.
+                        # To apply the output of ControlNet to both the unconditional and conditional batches,
+                        # add 0 to the unconditional batch to keep it unchanged.
+                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        return_dict=False,
+                    )[0]
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    pred_x0 = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+                    #first_x0 = pred_x0.detach()
+                    #first_x0_list.append(first_x0)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents_control2 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                    
+                    latents = latents_control2 * mask_control + (1.0 - mask_control) * latents_control1 # latents_control2 [0.2, 0.6]
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -935,6 +1033,14 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         first_result = image
         prev_result = image
         do_denormalize = [True] * image.shape[0]
+
+        image_cor = (
+            einops.rearrange(image, 'b c h w -> b h w c') * 127.5 +
+            127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+        color_corrections = setup_color_correction(Image.fromarray(image_cor[0]))
+
+
+
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         output_frames.append(image[0])
@@ -943,7 +1049,16 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         for idx in range(1, len(frames)):
             image = frames[idx]
             prev_image = frames[idx - 1]
-            
+
+            #frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            #img = HWC3(frame)
+            if color_preserve:
+                image = image
+            else:
+                image = apply_color_correction(color_corrections,
+                                            image)#Image.fromarray(image)
+                # image = totensor(img_).unsqueeze(0)[:, :3] / 127.5 - 1
+                
             # 5.1 prepare frames
             image = self.image_processor.preprocess(image).to(dtype=torch.float32)
             prev_image = self.image_processor.preprocess(prev_image).to(dtype=torch.float32)
@@ -1040,7 +1155,7 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             # 5.7 Denoising loop
             num_warmup_steps = len(timesteps) - cur_num_inference_steps * self.scheduler.order
 
-            def denoising_loop(latents, mask=None, xtrg=None, noise_rescale=None):
+            def denoising_loop(latents, mask=None, xtrg=None, noise_rescale=None, mask_control=None):
                 dir_xt = 0
                 latents_dtype = latents.dtype
                 with self.progress_bar(total=cur_num_inference_steps) as progress_bar:
@@ -1137,9 +1252,88 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                         dir_xt = (1.0 - alpha_t_prev) ** 0.5 * noise_pred
 
                         # compute the previous noisy sample x_t -> x_t-1
-                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[
+                        latents_control1 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[
                             0
                         ]
+
+                        if isinstance(controlnet_keep[i], list):
+                            cond_scale = [cond_scale[1], cond_scale[0]]
+                            print('latent2 control scale: ', cond_scale)
+                        else:
+                            controlnet_cond_scale = controlnet_conditioning_scale
+                            if isinstance(controlnet_cond_scale, list):
+                                controlnet_cond_scale = controlnet_cond_scale[0]
+                            cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                        down_block_res_samples, mid_block_res_sample = self.controlnet(
+                            control_model_input,
+                            t,
+                            encoder_hidden_states=controlnet_prompt_embeds,
+                            controlnet_cond=control_image,
+                            conditioning_scale=cond_scale,
+                            guess_mode=guess_mode,
+                            return_dict=False,
+                        )
+
+                        if guess_mode and do_classifier_free_guidance:
+                            # Infered ControlNet only for the conditional batch.
+                            # To apply the output of ControlNet to both the unconditional and conditional batches,
+                            # add 0 to the unconditional batch to keep it unchanged.
+                            down_block_res_samples = [
+                                torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples
+                            ]
+                            mid_block_res_sample = torch.cat(
+                                [torch.zeros_like(mid_block_res_sample), mid_block_res_sample]
+                            )
+
+                        # predict the noise residual
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
+                            return_dict=False,
+                        )[0]
+
+                        # perform guidance
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                        # Get pred_x0 from scheduler
+                        alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                        beta_prod_t = 1 - alpha_prod_t
+                        pred_x0 = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+
+                        if i + skip_t >= warp_start_t and i + skip_t <= warp_end_t:
+                            # warp x_0
+                            pred_x0 = (
+                                flow_warp(first_x0_list[i], warp_flow, mode="nearest") * warp_mask
+                                + (1 - warp_mask) * pred_x0
+                            )
+
+                            # get x_t from x_0
+                            latents = self.scheduler.add_noise(pred_x0, noise_pred, t).to(latents_dtype)
+
+                        prev_t = t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+                        if i == len(timesteps) - 1:
+                            alpha_t_prev = 1.0
+                        else:
+                            alpha_t_prev = self.scheduler.alphas_cumprod[prev_t]
+
+                        dir_xt = (1.0 - alpha_t_prev) ** 0.5 * noise_pred
+
+                        # compute the previous noisy sample x_t -> x_t-1
+                        latents_control2 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[
+                            0
+                        ]
+
+                        if mask_control == None:
+                            print('this way 2')
+                            latents = latents_control1
+                        else:
+                            latents = latents_control2 * mask_control + (1.0 - mask_control) * latents_control1 
 
                         # call the callback, if provided
                         if i == len(timesteps) - 1 or (
@@ -1155,9 +1349,11 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                 self.attn_state.to_load()
             else:
                 self.attn_state.to_load_and_store_prev()
-            latents = denoising_loop(init_latents)
+
+            latents = denoising_loop(init_latents, None, None, None, mask_control)
 
             if mask_start_t <= mask_end_t:
+                print('should not be here')
                 direct_result = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
 
                 blend_results = (1 - blend_mask_pre) * warped_pre + blend_mask_pre * direct_result

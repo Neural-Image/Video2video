@@ -30,7 +30,7 @@ def video_to_frame(video_path: str, interval: int):
     return res
 
 input_video_path = "/home/ubuntu/sws/recursive/Rerender_A_Video/videos/horserunning.mp4"
-input_interval = 2
+input_interval = 5
 frames = video_to_frame(
     input_video_path, input_interval)
 
@@ -52,19 +52,19 @@ control_frames = [control_tile_frames, control_canny_frames]
 
 controlnet = [
             ControlNetModel.from_pretrained("/home/ubuntu/sws/model/controlnet11/control_v11f1e_sd15_tile", torch_dtype=torch.float32),
-            ControlNetModel.from_pretrained("/home/ubuntu/sws/model/controlnet11/control_v11p_sd15s2_lineart_anime", torch_dtype=torch.float32),
+            ControlNetModel.from_pretrained("/home/ubuntu/sws/model/controlnet11/control_v11p_sd15_canny", torch_dtype=torch.float32),
         ]
 
 # You can use any fintuned SD here
 pipe = DiffusionPipeline.from_pretrained(
-    "/home/ubuntu/sws/stable-diffusion-v1-5", controlnet=controlnet, custom_pipeline='/home/ubuntu/sws/project/diffusers-Rerender-rerender/examples/community/rerender_a_video.py').to('cuda')
+    "/home/ubuntu/sws/stable-diffusion-v1-5", controlnet=controlnet, custom_pipeline='/home/ubuntu/liudong/diffusers-Rerender-rerender/examples/community/rerender_a_video.py').to('cuda')
 
 # Optional: you can download vae-ft-mse-840000-ema-pruned.ckpt to enhance the results
 # pipe.vae = AutoencoderKL.from_single_file(
 #     "/home/ubuntu/sws/model/vae-ft-mse-840000-ema-pruned.ckpt").to('cuda')
 
 pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-# pipe.enable_xformers_memory_efficient_attention()
+pipe.enable_xformers_memory_efficient_attention()
 
 generator = torch.manual_seed(0)
 # frames = [Image.fromarray(frame) for frame in frames]
@@ -73,6 +73,12 @@ for frame in frames:
     frame=cv2.resize(frame,(512,320))
     framesa.append(Image.fromarray(frame))
 frames = framesa
+
+# mask_control=torch.ones_like(latents)#(latents.shape[0:2], np.uint8)*255
+# zero_lines = int(latents.shape[2] * 2 / 3)
+# mask_control[:,:, 0:zero_lines, :]=0
+#mask_control = None
+
 output_frames = pipe(
     # "white ancient Greek sculpture, Venus de Milo, light pink and blue background",
     "sand flying,A horse was running in the desert, sand flying between its hooves",#,RAW photo, subject, (high detailed skin:1.2), 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3",
@@ -80,18 +86,20 @@ output_frames = pipe(
     control_frames,
     num_inference_steps=20,
     strength=0.95,
-    controlnet_conditioning_scale=[0.35, 0.5],
+    controlnet_conditioning_scale=[0.2, 0.8],  # tile, canny
     generator=generator,
     warp_start=0.0,
     warp_end=0.1,
     mask_start=0.5,
     mask_end=0.4,
+    bUseMaskControl=True,
+    color_preserve = False,
     mask_strength=0.5,
-    control_guidance_start=0.0,
-    control_guidance_end=1.0,
+    control_guidance_start=0,
+    control_guidance_end=1,
     negative_prompt="(deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime, mutated hands and fingers:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, disconnected limbs, mutation, mutated, ugly, disgusting, amputation"
     #'longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality'
 ).frames
 
 export_to_video(
-    output_frames, "/home/ubuntu/sws/recursive/Rerender_A_Video/videos/horse2canny-tail_diffout22.mp4", 10)
+    output_frames, "/home/ubuntu/liudong/diffusers-Rerender-rerender/video/horse2canny-tail_diffout31.mp4", 10)
