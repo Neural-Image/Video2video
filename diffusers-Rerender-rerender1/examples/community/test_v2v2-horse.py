@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from diffusers import DiffusionPipeline
 import cv2
+from free_lunch_utils import register_free_upblock2d, register_free_crossattn_upblock2d
 from PIL import Image
 
 import sys
