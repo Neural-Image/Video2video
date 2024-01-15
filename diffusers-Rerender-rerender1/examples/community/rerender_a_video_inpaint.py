@@ -32,7 +32,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import BaseOutput, deprecate, logging
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
-
+from diffusers import DiffusionPipeline,StableDiffusionControlNetInpaintPipeline
 
 gmflow_dir = "/home/ubuntu/sws/recursive/Rerender_A_Video/deps/gmflow/"
 sys.path.insert(0, gmflow_dir)
@@ -283,7 +283,7 @@ def prepare_image(image):
     return image
 
 
-class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
+class RerenderAVideoPipeline(StableDiffusionControlNetInpaintPipeline):
     r"""
     Pipeline for video-to-video translation using Stable Diffusion with Rerender Algorithm.
 
@@ -376,7 +376,11 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             feature_extractor=feature_extractor,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
+        #self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.control_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
         )
@@ -539,69 +543,84 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
 
         return timesteps, num_inference_steps - t_start
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.prepare_latents
-    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        
+        image_latents = self.vae.encode(image).latent_dist.sample(generator)
+
+        image_latents = self.vae.config.scaling_factor * image_latents
+
+        return image_latents
+
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint.StableDiffusionInpaintPipeline
+    def prepare_latents(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+        image=None,
+        timestep=None,
+        is_strength_max=True,
+        return_noise=False,
+        return_image_latents=False,
+    ):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        if (image is None or timestep is None) and not is_strength_max:
+            raise ValueError(
+                "Since strength < 1. initial latents are to be initialised as a combination of Image + Noise."
+                "However, either the image or the noise timestep has not been provided."
+            )
+
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
             raise ValueError(
                 f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
             )
 
-        image = image.to(device=device, dtype=dtype)
+        if return_image_latents or (latents is None and not is_strength_max):
+            image = image.to(device=device, dtype=dtype)
 
-        batch_size = batch_size * num_images_per_prompt
-
-        if image.shape[1] == 4:
-            init_latents = image
-
-        else:
-            if isinstance(generator, list) and len(generator) != batch_size:
-                raise ValueError(
-                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-                )
-
-            elif isinstance(generator, list):
-                init_latents = [
-                    self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
-                ]
-                init_latents = torch.cat(init_latents, dim=0)
+            if image.shape[1] == 4:
+                image_latents = image
             else:
-                init_latents = self.vae.encode(image).latent_dist.sample(generator)
+                image_latents = self._encode_vae_image(image=image, generator=generator)
+            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
 
-            init_latents = self.vae.config.scaling_factor * init_latents
-
-        if batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] == 0:
-            # expand init_latents for batch_size
-            deprecation_message = (
-                f"You have passed {batch_size} text prompts (`prompt`), but only {init_latents.shape[0]} initial"
-                " images (`image`). Initial images are now duplicating to match the number of text prompts. Note"
-                " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
-                " your script to pass as many initial images as text prompts to suppress this warning."
-            )
-            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)
-            additional_image_per_prompt = batch_size // init_latents.shape[0]
-            init_latents = torch.cat([init_latents] * additional_image_per_prompt, dim=0)
-        elif batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] != 0:
-            raise ValueError(
-                f"Cannot duplicate `image` of batch size {init_latents.shape[0]} to {batch_size} text prompts."
-            )
+        if latents is None:
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            latents = noise if is_strength_max else self.scheduler.add_noise(image_latents, noise, timestep)
+            # if pure noise then scale the initial latents by the  Scheduler's init sigma
+            latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
         else:
-            init_latents = torch.cat([init_latents], dim=0)
+            noise = latents.to(device)
+            latents = noise * self.scheduler.init_noise_sigma
 
-        shape = init_latents.shape
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        outputs = (latents,)
 
-        # get latents
-        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
-        latents = init_latents
+        if return_noise:
+            outputs += (noise,)
 
-        return latents
+        if return_image_latents:
+            outputs += (image_latents,)
+
+        return outputs
 
     @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
         frames: Union[List[np.ndarray], torch.FloatTensor] = None,
+        frames_mask: Union[List[np.ndarray], torch.FloatTensor] = None,
         control_frames: Union[List[np.ndarray], torch.FloatTensor] = None,
         strength: float = 0.8,
         num_inference_steps: int = 50,
@@ -641,6 +660,14 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                 instead.
             frames (`List[np.ndarray]` or `torch.FloatTensor`): The input images to be used as the starting point for the image generation process.
             control_frames (`List[np.ndarray]` or `torch.FloatTensor`): The ControlNet input images condition to provide guidance to the `unet` for generation.
+            frames_mask (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`,
+                    `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+                `Image`, NumPy array or tensor representing an image batch to mask `image`. White pixels in the mask
+                are repainted while black pixels are preserved. If `mask_image` is a PIL image, it is converted to a
+                single channel (luminance) before use. If it's a NumPy array or PyTorch tensor, it should contain one
+                color channel (L) instead of 3, so the expected shape for PyTorch tensor would be `(B, 1, H, W)`, `(B,
+                H, W)`, `(1, H, W)`, `(H, W)`. And for NumPy array, it would be for `(B, H, W, 1)`, `(B, H, W)`, `(H,
+                W, 1)`, or `(H, W)`.
             strength ('float'): SDEdit strength.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
@@ -808,6 +835,11 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         image = self.image_processor.preprocess(frames[0]).to(dtype=torch.float32)
         first_image = image[0]  # C, H, W
 
+        mask = self.mask_processor.preprocess(frames_mask[0], height=height, width=width)
+
+        masked_image = first_image * (mask < 0.5)
+        _, height, width = first_image.shape
+
         # 4.2 Prepare controlnet_conditioning_image
         # Currently we only support single control
         if isinstance(controlnet, ControlNetModel):
@@ -851,16 +883,45 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps, cur_num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
         latent_timestep = timesteps[:1].repeat(batch_size)
+        is_strength_max = strength == 1.0
 
         # 4.4 Prepare latent variables
-        latents = self.prepare_latents(
-            image,
-            latent_timestep,
-            batch_size,
-            num_images_per_prompt,
+        num_channels_latents = self.vae.config.latent_channels
+        num_channels_unet = self.unet.config.in_channels
+        return_image_latents = num_channels_unet == 4
+
+        latents_outputs = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
             prompt_embeds.dtype,
             device,
             generator,
+            None,
+            image=image,
+            timestep=latent_timestep,
+            is_strength_max=is_strength_max,
+            return_noise=True,
+            return_image_latents=return_image_latents,
+        )
+
+        if return_image_latents:
+            latents, noise, image_latents = latents_outputs
+        else:
+            latents, noise = latents_outputs
+
+        #  Prepare mask latent variables
+        mask, masked_image_latents = self.prepare_mask_latents(
+            mask,
+            masked_image,
+            batch_size * num_images_per_prompt,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            do_classifier_free_guidance,
         )
 
         if bUseMaskControl:
@@ -932,6 +993,11 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
                 # predict the noise residual
+                if num_channels_unet == 9:
+                    print('num channel unet equal 9')
+                    latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+
+                # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -955,10 +1021,25 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_control1 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                if num_channels_unet == 4:
+                    print('num channel unet equal 4')
+                    init_latents_proper = image_latents
+                    if do_classifier_free_guidance:
+                        init_mask, _ = mask.chunk(2)
+                    else:
+                        init_mask = mask
+
+                    if i < len(timesteps) - 1:
+                        noise_timestep = timesteps[i + 1]
+                        init_latents_proper = self.scheduler.add_noise(
+                            init_latents_proper, noise, torch.tensor([noise_timestep])
+                        )
+
+                    latents_control1 = (1 - init_mask) * init_latents_proper + init_mask * latents_control1
 
 
                 if bUseMaskControl == False:
-                    print('this way')
+                    #print('this way')
                     latents = latents_control1  # latents_control1 [0.6, 0.2]
                 else:
                     if isinstance(controlnet_keep[i], list):
@@ -989,6 +1070,9 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                         mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
                     # predict the noise residual
+                    if num_channels_unet == 9:
+                        latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+                    # predict the noise residual
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
@@ -1012,6 +1096,18 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
 
                     # compute the previous noisy sample x_t -> x_t-1
                     latents_control2 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    if num_channels_unet == 4:
+                        print('num channel unet equal 4')
+                        init_latents_proper = image_latents
+                        if do_classifier_free_guidance:
+                            init_mask, _ = mask.chunk(2)
+                        else:
+                            init_mask = mask
+                            
+                        if i < len(timesteps) - 1:
+                            noise_timestep = timesteps[i + 1]
+                            init_latents_proper = self.scheduler.add_noise(init_latents_proper, noise, torch.tensor([noise_timestep]))
+                        latents_control2 = (1 - init_mask) * init_latents_proper + init_mask * latents_control2
 
                     
                     latents = latents_control2 * mask_control + (1.0 - mask_control) * latents_control1 # latents_control2 [0.2, 0.6]
@@ -1046,6 +1142,11 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
         for idx in range(1, len(frames)):
             image = frames[idx]
             prev_image = frames[idx - 1]
+
+            image = self.image_processor.preprocess(image).to(dtype=torch.float32)
+            frame_image = image[0]  # C, H, W
+            mask_inpaint = self.mask_processor.preprocess(frames_mask[idx], height=height, width=width)
+            masked_image = frame_image * (mask_inpaint < 0.5)
 
             #frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             #img = HWC3(frame)
@@ -1127,15 +1228,38 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             mask_end_t = int(mask_end * num_inference_steps)
 
             # 5.4 Prepare latent variables
-            init_latents = self.prepare_latents(
-                image,
-                latent_timestep,
-                batch_size,
-                num_images_per_prompt,
-                prompt_embeds.dtype,
-                device,
-                generator,
-            )
+            
+            latents_outputs = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            None,
+            image=image,
+            timestep=latent_timestep,
+            is_strength_max=is_strength_max,
+            return_noise=True,
+            return_image_latents=return_image_latents,)
+            
+            if return_image_latents:
+                init_latents, noise, image_latents = latents_outputs
+            else:
+                init_latents, noise = latents_outputs
+
+            #  Prepare mask latent variables
+            mask_inpaint, masked_image_latents = self.prepare_mask_latents(
+            mask_inpaint,
+            masked_image,
+            batch_size * num_images_per_prompt,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            do_classifier_free_guidance,)
 
             # 5.5 Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
             extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1152,19 +1276,19 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             # 5.7 Denoising loop
             num_warmup_steps = len(timesteps) - cur_num_inference_steps * self.scheduler.order
 
-            def denoising_loop(latents, mask=None, xtrg=None, noise_rescale=None, mask_control=None):
+            def denoising_loop(latents, mask_inpaint, mask_re=None, xtrg=None, noise_rescale=None, mask_control=None, noise_img=None):
                 dir_xt = 0
                 latents_dtype = latents.dtype
                 with self.progress_bar(total=cur_num_inference_steps) as progress_bar:
                     for i, t in enumerate(timesteps):
                         self.attn_state.set_timestep(t.item())
                         if i + skip_t >= mask_start_t and i + skip_t <= mask_end_t and xtrg is not None:
-                            rescale = torch.maximum(1.0 - mask, (1 - mask**2) ** 0.5 * inner_strength)
+                            rescale = torch.maximum(1.0 - mask_re, (1 - mask_re**2) ** 0.5 * inner_strength)
                             if noise_rescale is not None:
-                                rescale = (1.0 - mask) * (1 - noise_rescale) + rescale * noise_rescale
-                            noise = randn_tensor(xtrg.shape, generator=generator, device=device, dtype=xtrg.dtype)
-                            latents_ref = self.scheduler.add_noise(xtrg, noise, t)
-                            latents = latents_ref * mask + (1.0 - mask) * (latents - dir_xt) + rescale * dir_xt
+                                rescale = (1.0 - mask_re) * (1 - noise_rescale) + rescale * noise_rescale
+                            noise_d = randn_tensor(xtrg.shape, generator=generator, device=device, dtype=xtrg.dtype)
+                            latents_ref = self.scheduler.add_noise(xtrg, noise_d, t)
+                            latents = latents_ref * mask_re + (1.0 - mask_re) * (latents - dir_xt) + rescale * dir_xt
                             latents = latents.to(latents_dtype)
 
                         # expand the latents if we are doing classifier free guidance
@@ -1210,6 +1334,10 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                             )
 
                         # predict the noise residual
+                        if num_channels_unet == 9:
+                            latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+
+                        # predict the noise residual
                         noise_pred = self.unet(
                             latent_model_input,
                             t,
@@ -1253,8 +1381,19 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                             0
                         ]
 
+                        if num_channels_unet == 4:
+                            init_latents_proper = image_latents
+                            if do_classifier_free_guidance:
+                                init_mask, _ = mask_inpaint.chunk(2)
+                            else:
+                                init_mask = mask_inpaint
+                            
+                            if i < len(timesteps) - 1:
+                                noise_timestep = timesteps[i + 1]
+                                init_latents_proper = self.scheduler.add_noise(init_latents_proper, noise, torch.tensor([noise_timestep]))
+                            latents_control1 = (1 - init_mask) * init_latents_proper + init_mask * latents_control1
+
                         if mask_control == None:
-                            print('this way 2')
                             latents = latents_control1
                         else:
                             if isinstance(controlnet_keep[i], list):
@@ -1287,6 +1426,9 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                                     [torch.zeros_like(mid_block_res_sample), mid_block_res_sample]
                                 )
 
+                            # predict the noise residual
+                            if num_channels_unet == 9:
+                                latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
                             # predict the noise residual
                             noise_pred = self.unet(
                                 latent_model_input,
@@ -1330,6 +1472,19 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                             latents_control2 = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[
                                 0
                             ]
+                            if num_channels_unet == 4:
+                                init_latents_proper = image_latents
+                                if do_classifier_free_guidance:
+                                    init_mask, _ = mask.chunk(2)
+                                else:
+                                    init_mask = mask
+                                
+                                if i < len(timesteps) - 1:
+                                    noise_timestep = timesteps[i + 1]
+                                    init_latents_proper = self.scheduler.add_noise(
+                                        init_latents_proper, noise_img, torch.tensor([noise_timestep]))
+                                latents_control2 = (1 - init_mask) * init_latents_proper + init_mask * latents_control2
+
                             latents = latents_control2 * mask_control + (1.0 - mask_control) * latents_control1 
 
                         # call the callback, if provided
@@ -1347,10 +1502,10 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             else:
                 self.attn_state.to_load_and_store_prev()
 
-            latents = denoising_loop(init_latents, None, None, None, mask_control)
+            latents = denoising_loop(init_latents, mask_inpaint, None, None, None, mask_control, noise)
 
             if mask_start_t <= mask_end_t:
-                print('should not be here')
+                #print('should not be here')
                 direct_result = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
 
                 blend_results = (1 - blend_mask_pre) * warped_pre + blend_mask_pre * direct_result
@@ -1391,7 +1546,7 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
                 timesteps, cur_num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
 
                 self.attn_state.to_load_and_store_prev()
-                latents = denoising_loop(init_latents, mask * mask_strength, xtrg, noise_rescale)
+                latents = denoising_loop(init_latents, mask_inpaint, mask * mask_strength, xtrg, noise_rescale)
 
             if not output_type == "latent":
                 image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
@@ -1408,7 +1563,7 @@ class RerenderAVideoPipeline(StableDiffusionControlNetImg2ImgPipeline):
             out_path=os.path.join("/home/ubuntu/liudong/diffusers-Rerender-rerender/video/",output_path.split("/")[-1].split(".")[0])
             if not os.path.exists(out_path): 
                 os.makedirs(out_path) 
-            image[0].save(os.path.join(out_path,str(idx)+".jpg"))
+            image[0].save(os.path.join(out_path,"%08d"%(idx)+".jpg"))
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
